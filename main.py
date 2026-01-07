@@ -318,6 +318,66 @@ def format_value_unit(value: str, unit: str) -> str:
     return f"{v}{u}"
 
 
+def load_resistor_prefix_rules(lk_wb):
+    if RES_PREFIX_SHEET not in lk_wb.sheetnames:
+        return {}
+
+    ws = lk_wb[RES_PREFIX_SHEET]
+    hdr = {normalize_text(ws.cell(1, c).value): c for c in range(1, ws.max_column + 1)}
+    for req in ["Prefix", "Rating_Value", "Rating_Unit"]:
+        if req not in hdr:
+            raise ValueError(f"{RES_PREFIX_SHEET} 시트에 필요한 헤더가 없습니다: {req}")
+
+    rules = defaultdict(list)
+    has_vendor = "Vendor" in hdr
+    has_priority = "Priority" in hdr
+
+    for r in range(2, ws.max_row + 1):
+        prefix = normalize_text(ws.cell(r, hdr["Prefix"]).value).upper()
+        if not prefix:
+            continue
+
+        raw_val = ws.cell(r, hdr["Rating_Value"]).value
+        raw_unit = ws.cell(r, hdr["Rating_Unit"]).value
+        if raw_val is None and raw_unit is None:
+            continue
+
+        vendor = ""
+        if has_vendor:
+            vendor = normalize_text(ws.cell(r, hdr["Vendor"]).value).upper()
+
+        pr = 1
+        if has_priority:
+            pv = ws.cell(r, hdr["Priority"]).value
+            if isinstance(pv, (int, float)):
+                pr = int(pv)
+
+        rules[prefix].append({
+            "vendor": vendor,
+            "priority": pr,
+            "value_unit": format_value_unit(raw_val, raw_unit),
+        })
+
+    return rules
+
+
+def pick_resistor_prefix_rating(part_name: str, prefix_rules: dict) -> str:
+    if not prefix_rules:
+        return ""
+    s = normalize_text(part_name)
+    if not s:
+        return ""
+    prefix = s[:5].upper()
+    candidates = prefix_rules.get(prefix, [])
+    if not candidates:
+        return ""
+
+    walsin = [c for c in candidates if c["vendor"] == "WALSIN"]
+    pool = walsin if walsin else candidates
+    pool_sorted = sorted(pool, key=lambda x: (x["priority"], x["value_unit"]))
+    return pool_sorted[0]["value_unit"] if pool_sorted else ""
+
+
 # =========================
 # 시트/규칙
 # =========================
@@ -333,6 +393,8 @@ SHEET_CFG = {
     "Connector": {"detail_col": None, "spec_col": 4, "actual_col": 5},
 }
 MANAGED_SHEETS = list(SHEET_CFG.keys())
+UNCLASS_SHEET = "미분류"
+RES_PREFIX_SHEET = "RESISTOR_PREFIX"
 
 RATING_SLOTS_BY_SHEET = {
     "Diode(Schottky_switching)": ["V_MAX", "I_MAX"],
@@ -434,6 +496,25 @@ def write_issue_report(report_path: Path, duplicate_refs: dict, rating_issues: l
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_unclassified_sheet(tpl_wb, ws_bom, unclassified_rows, sheet_name: str):
+    if sheet_name in tpl_wb.sheetnames:
+        ws = tpl_wb[sheet_name]
+    else:
+        ws = tpl_wb.create_sheet(sheet_name)
+
+    max_col = ws_bom.max_column
+    for c in range(1, max_col + 1):
+        ws.cell(1, c).value = ws_bom.cell(1, c).value
+
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    for i, row in enumerate(sorted(unclassified_rows, key=lambda x: x["bom_row"]), start=2):
+        vals = row["values"]
+        for c, val in enumerate(vals, start=1):
+            ws.cell(i, c).value = val
+
+
 # =========================
 # 파서 실행
 # =========================
@@ -508,6 +589,8 @@ def run_parser(bom_path: Path, template_path: Path, lookup_path: Path, out_xlsx:
                 continue
             rating_map[key][rec.field] = format_value_unit(rec.value, rec.unit)
 
+    resistor_prefix_rules = load_resistor_prefix_rules(lk_wb)
+
     # --- template ---
     tpl_wb = openpyxl.load_workbook(template_path)
     for s in MANAGED_SHEETS:
@@ -550,6 +633,7 @@ def run_parser(bom_path: Path, template_path: Path, lookup_path: Path, out_xlsx:
     ignored = defaultdict(int)
     ref_occurrences = defaultdict(list)
     routed_items = []
+    unclassified_rows = []
 
     for r in range(2, ws_bom.max_row + 1):
         raw_cat = ws_bom.cell(r, col_cls).value
@@ -564,11 +648,10 @@ def run_parser(bom_path: Path, template_path: Path, lookup_path: Path, out_xlsx:
         part = normalize_part(raw_part)
         detail = "" if raw_detail is None else normalize_text(raw_detail)
 
-        if not cat:
-            ignored["(NO_CATEGORY)"] += 1
-            continue
-        if cat not in base_cat_to_sheet:
-            ignored[cat] += 1
+        row_values = [ws_bom.cell(r, c).value for c in range(1, ws_bom.max_column + 1)]
+
+        if not cat or cat not in base_cat_to_sheet:
+            unclassified_rows.append({"bom_row": r, "values": row_values})
             continue
 
         base_sheet = base_cat_to_sheet[cat]
@@ -576,7 +659,7 @@ def run_parser(bom_path: Path, template_path: Path, lookup_path: Path, out_xlsx:
         sheet = routing.get((cat, sub), routing.get((cat, ""), base_sheet))
 
         if sheet not in MANAGED_SHEETS:
-            ignored[f"{cat}/{sub}->MISSING_SHEET:{sheet}"] += 1
+            unclassified_rows.append({"bom_row": r, "values": row_values})
             continue
 
         for ref in normalize_ref_list(raw_loc):
@@ -717,6 +800,38 @@ def run_parser(bom_path: Path, template_path: Path, lookup_path: Path, out_xlsx:
                 continue
 
             # 슬롯 규칙(여러 행에 정격값 순서대로 기입)
+            if sheet_name == "Resistor":
+                spec_one = pick_resistor_prefix_rating(part, resistor_prefix_rules)
+                if not spec_one:
+                    for f in FIELD_ORDER_BY_CATEGORY.get(cat, []):
+                        if f in part_ratings and part_ratings[f]:
+                            spec_one = part_ratings[f]
+                            break
+                safe_set(ws, record_start, cfg["spec_col"], spec_one if spec_one else None)
+
+                if not spec_one:
+                    suggestions = {}
+                    if lookup_has_any:
+                        for target in ["V_MAX", "I_MAX", "P_MAX", "V_RATED", "I_RATED"]:
+                            alts = suggest_alternatives(target, available_fields)
+                            if alts:
+                                suggestions[target] = alts
+
+                    rating_issues.append({
+                        "sheet": sheet_name,
+                        "ref": item["ref"],
+                        "part": part,
+                        "cat": cat,
+                        "sub": item["sub"],
+                        "bom_row": item["bom_row"],
+                        "missing_fields": ["(NO_MATCHED_FIELD)"],
+                        "lookup_has_any": lookup_has_any,
+                        "available_fields": sorted(available_fields),
+                        "available_raw_fields": sorted(available_raw_fields),
+                        "suggestions": suggestions
+                    })
+                continue
+
             if sheet_name in RATING_SLOTS_BY_SHEET:
                 slots = RATING_SLOTS_BY_SHEET[sheet_name]
                 n = min(len(slots), step)
@@ -789,6 +904,9 @@ def run_parser(bom_path: Path, template_path: Path, lookup_path: Path, out_xlsx:
             start_row, step = layouts[sheet_name]
             cfg = SHEET_CFG[sheet_name]
             clear_first_record_values(ws, start_row, step, cfg)
+
+    if unclassified_rows:
+        write_unclassified_sheet(tpl_wb, ws_bom, unclassified_rows, UNCLASS_SHEET)
 
     tpl_wb.save(out_xlsx)
     write_issue_report(out_txt, duplicate_refs, rating_issues, routed_items)

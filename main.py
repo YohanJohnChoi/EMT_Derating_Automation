@@ -540,6 +540,7 @@ def run_parser(bom_path: Path, template_path: Path, lookup_path: Path, out_xlsx:
     ratings = defaultdict(list)
     subcat_map = {}
     raw_field_map = defaultdict(set)
+    part_to_cats = defaultdict(set)
     has_priority = "Priority" in table_hdr
 
     for r in range(2, ws_table.max_row + 1):
@@ -561,6 +562,7 @@ def run_parser(bom_path: Path, template_path: Path, lookup_path: Path, out_xlsx:
 
         if not cat or not part:
             continue
+        part_to_cats[part].add(cat)
 
         key = (cat, part)
         if key not in subcat_map or (not subcat_map[key] and sub):
@@ -647,6 +649,16 @@ def run_parser(bom_path: Path, template_path: Path, lookup_path: Path, out_xlsx:
         cat = normalize_category(raw_cat)
         part = normalize_part(raw_part)
         detail = "" if raw_detail is None else normalize_text(raw_detail)
+
+        if cat == "FILTER":
+            candidates = []
+            for c in part_to_cats.get(part, set()):
+                sub_c = subcat_map.get((c, part), "")
+                sheet_c = routing.get((c, sub_c), routing.get((c, ""), base_cat_to_sheet.get(c)))
+                if sheet_c in MANAGED_SHEETS:
+                    candidates.append(c)
+            if len(candidates) == 1:
+                cat = candidates[0]
 
         row_values = [ws_bom.cell(r, c).value for c in range(1, ws_bom.max_column + 1)]
 

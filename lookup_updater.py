@@ -12,6 +12,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from io import FileIO
 from urllib.request import urlopen, Request
 from urllib.parse import urlparse, parse_qs
 
@@ -198,6 +199,13 @@ def is_drive_folder_link(link: str) -> bool:
     return "drive.google.com" in link and "folders" in link
 
 
+def extract_drive_folder_id(link: str) -> str | None:
+    if "drive.google.com" not in link:
+        return None
+    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", link)
+    return m.group(1) if m else None
+
+
 def download_drive_file(file_id: str, dest_path: Path):
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -247,6 +255,35 @@ def get_drive_service(app_dir: Path):
         token_path.write_text(creds.to_json(), encoding="utf-8")
 
     return build("drive", "v3", credentials=creds)
+
+
+def get_latest_file_in_folder(service, folder_id: str) -> dict | None:
+    q = f"'{folder_id}' in parents and trashed = false"
+    resp = service.files().list(
+        q=q,
+        orderBy="modifiedTime desc",
+        fields="files(id,name,modifiedTime,mimeType)",
+        pageSize=50,
+    ).execute()
+    files = resp.get("files", [])
+    if not files:
+        return None
+
+    for f in files:
+        if f.get("name", "").lower().endswith(".xlsx"):
+            return f
+    return files[0]
+
+
+def download_drive_file_via_api(service, file_id: str, dest_path: Path):
+    from googleapiclient.http import MediaIoBaseDownload
+
+    req = service.files().get_media(fileId=file_id)
+    with FileIO(dest_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, req)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
 
 
 def upload_drive_file(service, file_path: Path, folder_id: str, mime_type: str | None = None):
@@ -571,19 +608,6 @@ class App(tk.Tk):
             messagebox.showerror("Error", "Enter a Google Drive file link or file ID.")
             return
 
-        if is_drive_folder_link(link):
-            messagebox.showerror(
-                "Error",
-                "Folder links are not supported. Please use a direct file link or file ID.\n"
-                "Tip: keep the same file ID by updating the file version in Drive.",
-            )
-            return
-
-        file_id = extract_drive_file_id(link)
-        if not file_id:
-            messagebox.showerror("Error", "Unable to extract file ID from link.")
-            return
-
         lk = Path(self.var_lookup.get())
         if not lk.exists():
             messagebox.showerror("Error", "LookupTable path is invalid.")
@@ -594,7 +618,20 @@ class App(tk.Tk):
             self.var_status.set("Downloading...")
             self.update_idletasks()
 
-            download_drive_file(file_id, tmp)
+            if is_drive_folder_link(link):
+                folder_id = extract_drive_folder_id(link)
+                if not folder_id:
+                    raise ValueError("Unable to extract folder ID from link.")
+                service = get_drive_service(get_app_dir())
+                latest = get_latest_file_in_folder(service, folder_id)
+                if not latest:
+                    raise ValueError("No files found in folder.")
+                download_drive_file_via_api(service, latest["id"], tmp)
+            else:
+                file_id = extract_drive_file_id(link)
+                if not file_id:
+                    raise ValueError("Unable to extract file ID from link.")
+                download_drive_file(file_id, tmp)
 
             backup = lk.with_name(f"{lk.stem}_backup_{now_stamp()}{lk.suffix}")
             shutil.copy2(lk, backup)

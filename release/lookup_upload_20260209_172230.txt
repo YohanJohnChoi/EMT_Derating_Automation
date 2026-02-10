@@ -1,0 +1,9 @@
+=== LookupTable Upload Report ===
+- Created: 2026-02-09 17:22:30
+- Source: C:\bom_parser\release\LOOKUPTABLE.xlsx
+
+[1] Added Records
+  - None
+
+[2] Updated Records
+  - None

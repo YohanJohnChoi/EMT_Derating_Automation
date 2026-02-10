@@ -2,6 +2,13 @@
 배포자: John Choi (jhchoi@emtomega.com)
 ==========================================================
 Patch 내역
+*20260210
+LOOKUPTABLE UPDATER 프로그램 제작 및 배포
+- 최신화된 LOOKUPTABLE을 Google Drive Folder에서 내려받는 기능 추가
+- 로컬 LOOKUPTABLE에 부품정보를 추가하는 기능 추가
+- 변경된 로컬 LOOKUPTABLE을 Google Drive Folder에 업로드하는 기능 추가
+    최종 최신화 테이블 반영은 Google Drive Folder에서 관리자가 반영해야 적용됨
+    Google Drive Folder의 권한은 관리자인 최요한 DR가 Google ID(Gmail)을 전달받아야 등록이되어 받을 수 있음
 
 ----------------------------------------------------------
 *20260111
